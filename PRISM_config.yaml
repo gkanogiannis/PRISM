@@ -1,0 +1,44 @@
+# ============================================================================
+# NIRS Calibration Pipeline — Configuration
+# ============================================================================
+# Example datasets from:
+#   Pérez-Marín, D. et al. (2025). sensAIfood — NIR spectra for cereal grains.
+#   Zenodo. https://doi.org/10.5281/zenodo.16759587
+#
+# All paths are relative to the project root (the directory containing this file).
+# Run  python python/PRISM_pipeline.py  to start.
+
+# ── Datasets ─────────────────────────────────────────────────────────────────
+crops:
+  barley:
+    file: data/sensAIfood_UnivCordoba_v2/csv/Barley_sensAIfood_UnivCordoba_v2.csv
+  maize:
+    file: data/sensAIfood_UnivCordoba_v2/csv/Maize_sensAIfood_UnivCordoba_v2.csv
+  wheat:
+    file: data/sensAIfood_UnivCordoba_v2/csv/Wheat_sensAIfood_UnivCordoba_v2.csv
+
+# ── Trait display labels ──────────────────────────────────────────────────────
+trait_labels:
+  Moisture: "Moisture %"
+  Protein:  "Protein %"
+
+# ── Trait whitelist ───────────────────────────────────────────────────────────
+# Restrict modelling to Moisture and Protein only.
+# (The Year column is numeric and would otherwise be picked up automatically.)
+trait_include:
+  barley: [Moisture, Protein]
+  maize:  [Moisture, Protein]
+  wheat:  [Moisture, Protein]
+
+# ── Pipeline defaults ─────────────────────────────────────────────────────────
+pipeline:
+  seed:      42
+  n_folds:   10
+  test_size: 0.2
+
+  # Methods used in the standard grid run
+  full_methods:  [pls, lasso, enet, svr, rf, xgb, lgbm]
+  # Methods used with --quick flag (skips slow tree methods)
+  quick_methods: [pls, lasso, enet, svr, lgbm]
+  # Preprocessing methods to grid-search over
+  preprocs:      [snv, msc, sg1, sg2]
