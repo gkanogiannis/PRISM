@@ -21,7 +21,7 @@ A Python machine-learning pipeline for building and comparing **Near-Infrared Sp
 ![Python](https://img.shields.io/badge/Python-3.10%2B-306998?logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white)
 ![scikit-learn](https://img.shields.io/badge/scikit--learn-1.x-F7931E?logo=scikit-learn&logoColor=white)
-![License: MIT](https://img.shields.io/badge/License-MIT-2d6a4f)
+![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-2d6a4f)
 
 ---
 
@@ -65,7 +65,7 @@ This pipeline:
 
 The bundled `PRISM_config.yaml` uses the publicly available **sensAIfood** cereal NIR dataset:
 
-> Pérez-Marín, D. et al. (2025). *sensAIfood — NIR spectra for cereal grains (barley, maize, wheat) with Moisture and Protein reference values.* University of Córdoba / sensAIfood consortium. Zenodo. [https://doi.org/10.5281/zenodo.16759587](https://doi.org/10.5281/zenodo.16759587)
+> Pérez-Marín, D. et al. (2025). *sensAIfood: NIR spectra for cereal grains (barley, maize, wheat) with Moisture and Protein reference values.* University of Córdoba / sensAIfood consortium. Zenodo. [https://doi.org/10.5281/zenodo.16759587](https://doi.org/10.5281/zenodo.16759587)
 
 | Dataset | Samples | Wavelengths | Range |
 |---------|--------:|------------:|-------|
@@ -488,8 +488,8 @@ Analytes without direct NIR absorption (e.g. fermentation products) are predicte
 
 ## Licence
 
-MIT. See [LICENSE](LICENSE).
+Apache 2.0. Copyright 2026 Anestis Gkanogiannis. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 ---
 
-**Author:** Anestis Gkanogiannis · [ganoyan@gmail.com](mailto:ganoyan@gmail.com)
+**Author:** Anestis Gkanogiannis · [anestis@gkanogiannis.com](mailto:anestis@gkanogiannis.com)

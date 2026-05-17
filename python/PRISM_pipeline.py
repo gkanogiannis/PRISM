@@ -17,15 +17,33 @@ import os
 import sys
 import argparse
 import warnings
-warnings.filterwarnings('ignore')
-# sklearn ≥ 1.4 warns when third-party libs (LightGBM, XGBoost) use joblib.delayed
-# directly instead of sklearn.utils.parallel.delayed. Harmless — suppress explicitly.
-warnings.filterwarnings(
-    'ignore',
-    message=r'.*sklearn\.utils\.parallel\.delayed.*',
-    category=UserWarning,
-    module='sklearn',
-)
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+from sklearn.exceptions import ConvergenceWarning
+warnings.filterwarnings('ignore', category=ConvergenceWarning)
+
+# Python 3.12+ made warning filters thread-local, so main-thread filters do not
+# suppress warnings raised inside joblib worker threads. Patch Parallel.__call__
+# directly so suppression applies at the call site regardless of thread context.
+try:
+    import sklearn.utils.parallel as _skp
+    _orig_parallel_call = _skp.Parallel.__call__
+
+    def _parallel_call_quiet(self, iterable):
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            return _orig_parallel_call(self, iterable)
+
+    _skp.Parallel.__call__ = _parallel_call_quiet
+except Exception:
+    pass
+
+# Propagate suppression to spawned worker processes via the environment.
+_pw = os.environ.get('PYTHONWARNINGS', '')
+for _w in ('ignore::UserWarning', 'ignore::FutureWarning'):
+    if _w not in _pw:
+        _pw = f'{_pw},{_w}'.strip(',')
+os.environ['PYTHONWARNINGS'] = _pw
 
 import numpy as np
 import pandas as pd
@@ -69,7 +87,7 @@ try:
 except ImportError:
     HAS_SHAP = False
 
-# GPU availability flags — checked once at import, used by XGBoost/LightGBM/CNN
+# GPU availability flags that are checked once at import, used by XGBoost/LightGBM/CNN
 _CUDA = HAS_TORCH and torch.cuda.is_available()
 _WSL  = os.path.exists('/proc/version') and 'microsoft' in open('/proc/version').read().lower()
 _XGB_DEVICE  = 'cuda' if _CUDA else 'cpu'          # XGBoost ≥ 2.0 'device' kwarg
@@ -93,6 +111,27 @@ TRAIT_LABELS:          dict = {}   # col_name  → display label
 DEFAULT_METHODS_FULL   = ['pls', 'lasso', 'enet', 'svr', 'rf', 'xgb', 'lgbm']
 DEFAULT_METHODS_QUICK  = ['pls', 'lasso', 'enet', 'svr', 'lgbm']
 DEFAULT_PREPROCS       = ['snv', 'msc', 'sg1', 'sg2']
+MODEL_PARAMS:          dict = {}   # method → {param: value}; populated from config
+
+
+import contextlib
+
+@contextlib.contextmanager
+def _quiet():
+    """Suppress all warnings inside a block — robust across Python versions."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        yield
+
+
+def _mp(method: str, key: str, default):
+    """Return MODEL_PARAMS[method][key] if set, else default."""
+    return MODEL_PARAMS.get(method, {}).get(key, default)
+
+
+def _to_list(v):
+    """Wrap scalar in list; leave lists unchanged (for GridSearchCV grids)."""
+    return v if isinstance(v, list) else [v]
 
 _DEFAULT_CONFIG_PATH   = os.path.join(BASE_DIR, 'PRISM_config.yaml')
 
@@ -118,6 +157,7 @@ def apply_config(cfg: dict) -> None:
     global SEED, N_FOLDS, CV
     global CROP_CONFIG, TRAIT_LABELS
     global DEFAULT_METHODS_FULL, DEFAULT_METHODS_QUICK, DEFAULT_PREPROCS
+    global MODEL_PARAMS
 
     pip = cfg.get('pipeline', {})
     SEED    = pip.get('seed',    SEED)
@@ -143,6 +183,10 @@ def apply_config(cfg: dict) -> None:
     if 'trait_include' in cfg:
         for crop, traits in cfg['trait_include'].items():
             TRAIT_INCLUDE[crop] = traits
+
+    if 'model_params' in cfg:
+        MODEL_PARAMS.clear()
+        MODEL_PARAMS.update(cfg['model_params'] or {})
 
 
 def _auto_discover_crops(csv_dir: str) -> None:
@@ -277,8 +321,9 @@ def _metrics(y_true, y_pred):
 
 
 # ── Model helpers ──────────────────────────────────────────────────────────
-def _fit_pls(X_tr, y_tr, max_comp=15):
-    max_comp = min(max_comp, X_tr.shape[1], X_tr.shape[0] - 1)
+def _fit_pls(X_tr, y_tr, max_comp=None):
+    max_comp = min(_mp('pls', 'max_comp', 15) if max_comp is None else max_comp,
+                   X_tr.shape[1], X_tr.shape[0] - 1)
     best_rmse, best_nc, best_preds = np.inf, 1, None
     for nc in range(1, max_comp + 1):
         preds = cross_val_predict(
@@ -293,30 +338,36 @@ def _fit_pls(X_tr, y_tr, max_comp=15):
 
 
 def _make_grid_estimator(method: str):
-    lam = np.logspace(-4, 0, 25)
-    C   = np.logspace(-2, 2, 10)
+    lam = _mp(method, 'alpha',    np.logspace(-4, 0, 25).tolist())
+    C   = _mp(method, 'C',        np.logspace(-2, 2, 10).tolist())
     if method == 'lasso':
-        return Lasso(max_iter=5000), {'alpha': lam}
+        return (Lasso(max_iter=_mp('lasso', 'max_iter', 10000)),
+                {'alpha': _to_list(lam)})
     if method == 'enet':
-        return ElasticNet(max_iter=5000), {
-            'alpha': lam, 'l1_ratio': [0.1, 0.3, 0.5, 0.7, 0.9, 1.0]}
+        return (ElasticNet(max_iter=_mp('enet', 'max_iter', 10000)),
+                {'alpha':    _to_list(lam),
+                 'l1_ratio': _to_list(_mp('enet', 'l1_ratio', [0.1, 0.3, 0.5, 0.7, 0.9, 1.0]))})
     if method == 'svr':
         return (Pipeline([('sc', StandardScaler()),
-                          ('svr', LinearSVR(max_iter=5000))]),
-                {'svr__C': C})
+                          ('svr', LinearSVR(max_iter=_mp('svr', 'max_iter', 5000)))]),
+                {'svr__C': _to_list(C)})
     if method == 'rf':
-        return (RandomForestRegressor(n_estimators=300, random_state=SEED, n_jobs=-1),
-                {'max_features': ['sqrt', 0.1, 0.3]})
+        return (RandomForestRegressor(
+                    n_estimators=_mp('rf', 'n_estimators', 300),
+                    random_state=SEED, n_jobs=_mp('rf', 'n_jobs', 1)),
+                {'max_features': _to_list(_mp('rf', 'max_features', ['sqrt', 0.1, 0.3]))})
     if method == 'xgb':
         return (xgb.XGBRegressor(n_jobs=1, random_state=SEED, verbosity=0,
                                   device=_XGB_DEVICE),
-                {'n_estimators': [100, 200], 'max_depth': [3, 5],
-                 'learning_rate': [0.05, 0.10]})
+                {'n_estimators':  _to_list(_mp('xgb', 'n_estimators',  [100, 200])),
+                 'max_depth':     _to_list(_mp('xgb', 'max_depth',     [3, 5])),
+                 'learning_rate': _to_list(_mp('xgb', 'learning_rate', [0.05, 0.10]))})
     if method == 'lgbm':
         return (lgb.LGBMRegressor(n_jobs=1, random_state=SEED, verbose=-1,
                                    device=_LGBM_DEVICE),
-                {'n_estimators': [100, 200], 'max_depth': [3, 5],
-                 'learning_rate': [0.05, 0.10]})
+                {'n_estimators':  _to_list(_mp('lgbm', 'n_estimators',  [100, 200])),
+                 'max_depth':     _to_list(_mp('lgbm', 'max_depth',     [3, 5])),
+                 'learning_rate': _to_list(_mp('lgbm', 'learning_rate', [0.05, 0.10]))})
     raise ValueError(f'Unknown method: {method!r}')
 
 
@@ -339,22 +390,23 @@ def run_analysis(crop_name, trait_name, method, prep_method,
     X_te_pp, _,  _  = preprocess_spectra(X_te, prep_method, ref=ref)
 
     try:
-        if method == 'pls':
-            model, r2_cv, rmse_cv = _fit_pls(X_tr_pp, y_tr)
-            if verbose:
-                print(f'    params: n_components={model.n_components}')
-        else:
-            est, grid = _make_grid_estimator(method)
-            gs = GridSearchCV(est, grid, cv=CV,
-                              scoring='neg_root_mean_squared_error',
-                              n_jobs=-1, refit=True)
-            gs.fit(X_tr_pp, y_tr)
-            model   = gs.best_estimator_
-            cv_p    = cross_val_predict(model, X_tr_pp, y_tr, cv=CV)
-            r2_cv   = r2_score(y_tr, cv_p)
-            rmse_cv = np.sqrt(mean_squared_error(y_tr, cv_p))
-            if verbose:
-                print(f'    params: {gs.best_params_}')
+        with _quiet():
+            if method == 'pls':
+                model, r2_cv, rmse_cv = _fit_pls(X_tr_pp, y_tr)
+                if verbose:
+                    print(f'    params: n_components={model.n_components}')
+            else:
+                est, grid = _make_grid_estimator(method)
+                gs = GridSearchCV(est, grid, cv=CV,
+                                  scoring='neg_root_mean_squared_error',
+                                  n_jobs=-1, refit=True)
+                gs.fit(X_tr_pp, y_tr)
+                model   = gs.best_estimator_
+                cv_p    = cross_val_predict(model, X_tr_pp, y_tr, cv=CV)
+                r2_cv   = r2_score(y_tr, cv_p)
+                rmse_cv = np.sqrt(mean_squared_error(y_tr, cv_p))
+                if verbose:
+                    print(f'    params: {gs.best_params_}')
     except Exception as e:
         print(f'  [error] {crop_name}/{trait_name}/{method}/{prep_method}: {e}')
         return None
@@ -380,21 +432,29 @@ def run_analysis(crop_name, trait_name, method, prep_method,
 
 # ── Stacking ensemble ──────────────────────────────────────────────────────
 def _make_stack():
+    sp = MODEL_PARAMS.get('stack', {})
     return StackingRegressor(
         estimators=[
-            ('pls',  PLSRegression(n_components=5, scale=True)),
-            ('lasso', Lasso(alpha=0.01, max_iter=5000)),
+            ('pls',  PLSRegression(
+                        n_components=sp.get('pls_n_components', 5), scale=True)),
+            ('lasso', Lasso(
+                        alpha=sp.get('lasso_alpha', 0.01),
+                        max_iter=sp.get('lasso_max_iter', 10000))),
             ('svr',   Pipeline([('sc', StandardScaler()),
-                                ('svr', LinearSVR(max_iter=5000))])),
-            ('xgb',  xgb.XGBRegressor(n_estimators=100, max_depth=3,
-                                       learning_rate=0.1, verbosity=0,
-                                       random_state=SEED, device=_XGB_DEVICE)),
-            ('lgbm', lgb.LGBMRegressor(n_estimators=100, max_depth=3,
-                                        learning_rate=0.1, verbose=-1,
-                                        random_state=SEED, device=_LGBM_DEVICE)),
+                                ('svr', LinearSVR(max_iter=sp.get('svr_max_iter', 5000)))])),
+            ('xgb',  xgb.XGBRegressor(
+                        n_estimators=sp.get('xgb_n_estimators', 100),
+                        max_depth=sp.get('xgb_max_depth', 3),
+                        learning_rate=sp.get('xgb_learning_rate', 0.1),
+                        verbosity=0, random_state=SEED, device=_XGB_DEVICE)),
+            ('lgbm', lgb.LGBMRegressor(
+                        n_estimators=sp.get('lgbm_n_estimators', 100),
+                        max_depth=sp.get('lgbm_max_depth', 3),
+                        learning_rate=sp.get('lgbm_learning_rate', 0.1),
+                        verbose=-1, random_state=SEED, device=_LGBM_DEVICE)),
         ],
-        final_estimator=Ridge(alpha=1.0),
-        cv=5, n_jobs=-1,
+        final_estimator=Ridge(alpha=sp.get('ridge_alpha', 1.0)),
+        cv=sp.get('cv', 5), n_jobs=-1,
     )
 
 
@@ -415,11 +475,12 @@ def run_analysis_stack(crop_name, trait_name, prep_method='snv', test_size=0.2):
     X_te_pp, _,  _  = preprocess_spectra(X_te, prep_method, ref=ref)
 
     try:
-        model = _make_stack()
-        model.fit(X_tr_pp, y_tr)
-        cv_p    = cross_val_predict(_make_stack(), X_tr_pp, y_tr, cv=CV)
-        r2_cv   = r2_score(y_tr, cv_p)
-        rmse_cv = np.sqrt(mean_squared_error(y_tr, cv_p))
+        with _quiet():
+            model = _make_stack()
+            model.fit(X_tr_pp, y_tr)
+            cv_p    = cross_val_predict(_make_stack(), X_tr_pp, y_tr, cv=CV)
+            r2_cv   = r2_score(y_tr, cv_p)
+            rmse_cv = np.sqrt(mean_squared_error(y_tr, cv_p))
     except Exception as e:
         print(f'  [stack error] {crop_name}/{trait_name}: {e}')
         return None
@@ -444,10 +505,12 @@ def run_analysis_stack(crop_name, trait_name, prep_method='snv', test_size=0.2):
 # ── Gaussian Process Regression ────────────────────────────────────────────
 def _make_gpr():
     return Pipeline([
-        ('pca', PCA(n_components=20)),
+        ('pca', PCA(n_components=_mp('gpr', 'n_components', 20))),
         ('gpr', GaussianProcessRegressor(
-            kernel=RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1),
-            n_restarts_optimizer=3, normalize_y=True, random_state=SEED,
+            kernel=(RBF(length_scale=_mp('gpr', 'length_scale', 1.0)) +
+                    WhiteKernel(noise_level=_mp('gpr', 'noise_level', 0.1))),
+            n_restarts_optimizer=_mp('gpr', 'n_restarts_optimizer', 3),
+            normalize_y=True, random_state=SEED,
         )),
     ])
 
@@ -468,18 +531,19 @@ def run_analysis_gpr(crop_name, trait_name, prep_method='snv', test_size=0.2):
     X_tr_pp, ref, _ = preprocess_spectra(X_tr, prep_method)
     X_te_pp, _,  _  = preprocess_spectra(X_te, prep_method, ref=ref)
 
-    try:
-        gpr = _make_gpr()
-        gpr.fit(X_tr_pp, y_tr)
-    except Exception as e:
-        print(f'  [gpr error] {crop_name}/{trait_name}: {e}')
-        return None
+    with _quiet():
+        try:
+            gpr = _make_gpr()
+            gpr.fit(X_tr_pp, y_tr)
+        except Exception as e:
+            print(f'  [gpr error] {crop_name}/{trait_name}: {e}')
+            return None
 
-    pca_te    = gpr['pca'].transform(X_te_pp)
-    mu, sigma = gpr['gpr'].predict(pca_te, return_std=True)
-    cv_p      = cross_val_predict(_make_gpr(), X_tr_pp, y_tr, cv=CV)
-    r2_cv     = r2_score(y_tr, cv_p)
-    rmse_cv   = np.sqrt(mean_squared_error(y_tr, cv_p))
+        pca_te    = gpr['pca'].transform(X_te_pp)
+        mu, sigma = gpr['gpr'].predict(pca_te, return_std=True)
+        cv_p      = cross_val_predict(_make_gpr(), X_tr_pp, y_tr, cv=CV)
+        r2_cv     = r2_score(y_tr, cv_p)
+        rmse_cv   = np.sqrt(mean_squared_error(y_tr, cv_p))
 
     r2_cal, rmse_cal, _ = _metrics(y_tr, gpr.predict(X_tr_pp))
     r2_val, rmse_val, rpd_val = _metrics(y_te, mu)
@@ -519,23 +583,32 @@ def run_analysis_cnn(crop_name, trait_name, prep_method='snv', test_size=0.2):
     X_tr_pp, ref, _ = preprocess_spectra(X_tr, prep_method)
     X_te_pp, _,  _  = preprocess_spectra(X_te, prep_method, ref=ref)
 
-    try:
-        torch.manual_seed(SEED)
-        model = CNN1DRegressor(epochs=200, patience=30)
-        model.fit(X_tr_pp, y_tr)
-    except Exception as e:
-        print(f'  [cnn error] {crop_name}/{trait_name}: {e}')
-        return None
+    _cnn_epochs    = _mp('cnn', 'epochs',      200)
+    _cnn_batch     = _mp('cnn', 'batch_size',  16)
+    _cnn_patience  = _mp('cnn', 'patience',    30)
+    _cnn_cv_epochs = _mp('cnn', 'cv_epochs',   max(50, _cnn_epochs - 50))
+    _cnn_cv_pat    = _mp('cnn', 'cv_patience', max(10, _cnn_patience - 10))
 
-    kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
-    cv_preds = np.empty(len(y_tr))
-    for tr_i, va_i in kf.split(X_tr_pp):
-        torch.manual_seed(SEED)
-        c_fold = CNN1DRegressor(epochs=150, patience=20)
-        c_fold.fit(X_tr_pp[tr_i], y_tr[tr_i])
-        cv_preds[va_i] = c_fold.predict(X_tr_pp[va_i]).ravel()
-    r2_cv   = r2_score(y_tr, cv_preds)
-    rmse_cv = np.sqrt(mean_squared_error(y_tr, cv_preds))
+    with _quiet():
+        try:
+            torch.manual_seed(SEED)
+            model = CNN1DRegressor(epochs=_cnn_epochs, patience=_cnn_patience,
+                                   batch_size=_cnn_batch)
+            model.fit(X_tr_pp, y_tr)
+        except Exception as e:
+            print(f'  [cnn error] {crop_name}/{trait_name}: {e}')
+            return None
+
+        kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+        cv_preds = np.empty(len(y_tr))
+        for tr_i, va_i in kf.split(X_tr_pp):
+            torch.manual_seed(SEED)
+            c_fold = CNN1DRegressor(epochs=_cnn_cv_epochs, patience=_cnn_cv_pat,
+                                    batch_size=_cnn_batch)
+            c_fold.fit(X_tr_pp[tr_i], y_tr[tr_i])
+            cv_preds[va_i] = c_fold.predict(X_tr_pp[va_i]).ravel()
+        r2_cv   = r2_score(y_tr, cv_preds)
+        rmse_cv = np.sqrt(mean_squared_error(y_tr, cv_preds))
 
     cal_p = model.predict(X_tr_pp)
     val_p = model.predict(X_te_pp)
@@ -651,7 +724,7 @@ if HAS_TORCH:
                 return self.model_(torch.tensor(X).to(DEVICE)).cpu().numpy()
 
         def saliency(self, X):
-            """Mean |∂output/∂input| — wavelength importance."""
+            """Mean |∂output/∂input| is the wavelength importance."""
             self.model_.eval()
             X_t = torch.tensor(np.asarray(X, np.float32),
                                device=DEVICE, requires_grad=True)
@@ -767,7 +840,7 @@ def _parse_args():
                    help='Path to YAML config file '
                         f'(default: {_DEFAULT_CONFIG_PATH})')
     p.add_argument('--quick', action='store_true',
-                   help='Skip CNN, RF, XGB — faster exploratory run')
+                   help='Skip CNN, RF, XGB for a faster exploratory run')
     p.add_argument('--crops',   nargs='+', default=None, metavar='CROP',
                    help='Crops to run (default: all crops in config)')
     p.add_argument('--traits',  nargs='+', default=None, metavar='TRAIT',
@@ -880,7 +953,7 @@ if __name__ == '__main__':
     traits_by_crop = {c: args.traits or AVAILABLE_TRAITS[c] for c in CROPS}
 
     print('=' * 60)
-    print('NIRS Calibration — Python pipeline')
+    print('NIRS Calibration: a Python pipeline')
     print(f'Crops:         {CROPS}')
     for crop, traits in traits_by_crop.items():
         print(f'  {crop}: {traits}')
@@ -894,7 +967,7 @@ if __name__ == '__main__':
         print(f'GPU:           {props.name}  ({props.total_memory/1e9:.1f} GB VRAM)')
         print(f'               XGBoost={_XGB_DEVICE}  LightGBM={_LGBM_DEVICE}  CNN=cuda')
     else:
-        print('GPU:           not available — running on CPU')
+        print('GPU:           not available so we are running on CPU')
     print('=' * 60)
 
     # ── Main grid run ──────────────────────────────────────────────────────
@@ -981,27 +1054,28 @@ if __name__ == '__main__':
         wl_use = wl[wl_trim:len(wl)-wl_trim] if wl_trim > 0 else wl
 
         try:
-            if method == 'pls':
-                model_obj, _, _ = _fit_pls(X_tr_pp, y_tr)
-            elif method == 'stack':
-                model_obj = _make_stack()
-                model_obj.fit(X_tr_pp, y_tr)
-            elif method == 'gpr':
-                model_obj = _make_gpr()
-                model_obj.fit(X_tr_pp, y_tr)
-            elif method == 'cnn':
-                if not HAS_TORCH:
-                    print(f'  [skip] {crop}/{trait}: torch not available'); continue
-                torch.manual_seed(SEED)
-                model_obj = CNN1DRegressor(epochs=200, patience=30)
-                model_obj.fit(X_tr_pp, y_tr)
-            else:
-                est, grid = _make_grid_estimator(method)
-                gs = GridSearchCV(est, grid, cv=CV,
-                                  scoring='neg_root_mean_squared_error',
-                                  n_jobs=-1, refit=True)
-                gs.fit(X_tr_pp, y_tr)
-                model_obj = gs.best_estimator_
+            with _quiet():
+                if method == 'pls':
+                    model_obj, _, _ = _fit_pls(X_tr_pp, y_tr)
+                elif method == 'stack':
+                    model_obj = _make_stack()
+                    model_obj.fit(X_tr_pp, y_tr)
+                elif method == 'gpr':
+                    model_obj = _make_gpr()
+                    model_obj.fit(X_tr_pp, y_tr)
+                elif method == 'cnn':
+                    if not HAS_TORCH:
+                        print(f'  [skip] {crop}/{trait}: torch not available'); continue
+                    torch.manual_seed(SEED)
+                    model_obj = CNN1DRegressor(epochs=200, patience=30)
+                    model_obj.fit(X_tr_pp, y_tr)
+                else:
+                    est, grid = _make_grid_estimator(method)
+                    gs = GridSearchCV(est, grid, cv=CV,
+                                      scoring='neg_root_mean_squared_error',
+                                      n_jobs=-1, refit=True)
+                    gs.fit(X_tr_pp, y_tr)
+                    model_obj = gs.best_estimator_
         except Exception as e:
             print(f'  [skip] {crop}/{trait}: {e}'); continue
 

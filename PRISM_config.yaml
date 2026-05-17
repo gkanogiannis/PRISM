@@ -1,8 +1,8 @@
 # ============================================================================
-# NIRS Calibration Pipeline — Configuration
+# NIRS Calibration Pipeline: Configuration
 # ============================================================================
 # Example datasets from:
-#   Pérez-Marín, D. et al. (2025). sensAIfood — NIR spectra for cereal grains.
+#   Pérez-Marín, D. et al. (2025). sensAIfood: NIR spectra for cereal grains.
 #   Zenodo. https://doi.org/10.5281/zenodo.16759587
 #
 # All paths are relative to the project root (the directory containing this file).
@@ -42,3 +42,58 @@ pipeline:
   quick_methods: [pls, lasso, enet, svr, lgbm]
   # Preprocessing methods to grid-search over
   preprocs:      [snv, msc, sg1, sg2]
+
+# ── Model parameters ──────────────────────────────────────────────────────────
+# Override any entry to tune training. Omit a section to keep built-in defaults.
+# For grid-search methods (lasso, enet, svr, xgb, lgbm) list values define the
+# search grid; a single scalar is treated as a one-element grid.
+#
+# model_params:
+#   pls:
+#     max_comp: 15                          # max PLS components searched by CV
+#   lasso:
+#     alpha: [0.0001, 0.001, 0.01, 0.1, 1.0]  # regularisation grid
+#     max_iter: 10000
+#   enet:
+#     alpha: [0.0001, 0.001, 0.01, 0.1, 1.0]
+#     l1_ratio: [0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
+#     max_iter: 10000
+#   svr:
+#     C: [0.01, 0.1, 1.0, 10.0, 100.0]
+#     max_iter: 5000
+#   rf:
+#     n_estimators: 300
+#     max_features: [sqrt, 0.1, 0.3]
+#     n_jobs: 1          # keep at 1 to avoid sklearn/joblib threading warnings on Python 3.12+
+#   xgb:
+#     n_estimators: [100, 200]
+#     max_depth: [3, 5]
+#     learning_rate: [0.05, 0.10]
+#   lgbm:
+#     n_estimators: [100, 200]
+#     max_depth: [3, 5]
+#     learning_rate: [0.05, 0.10]
+#   stack:
+#     pls_n_components: 5
+#     lasso_alpha: 0.01
+#     lasso_max_iter: 10000
+#     svr_max_iter: 5000
+#     xgb_n_estimators: 100
+#     xgb_max_depth: 3
+#     xgb_learning_rate: 0.1
+#     lgbm_n_estimators: 100
+#     lgbm_max_depth: 3
+#     lgbm_learning_rate: 0.1
+#     ridge_alpha: 1.0
+#     cv: 5
+#   gpr:
+#     n_components: 20       # PCA components before GPR
+#     length_scale: 1.0      # RBF kernel initial length scale
+#     noise_level: 0.1       # WhiteKernel initial noise level
+#     n_restarts_optimizer: 3
+#   cnn:
+#     epochs: 200
+#     batch_size: 16
+#     patience: 30
+#     cv_epochs: 150         # epochs used for CV fold fits
+#     cv_patience: 20
